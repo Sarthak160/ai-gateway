@@ -1,0 +1,25 @@
+# Temporary: builds the controller image from the managed-identity PR branch
+# and pushes it to ghcr for the AKS e2e validation (upstream PR #2378 /
+# issue #1180). Lives only on this side branch — never on the PR branch.
+name: build-mi-test-image
+on: workflow_dispatch
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build controller binary
+        run: make build.controller GOOS_LIST=linux GOARCH_LIST=amd64
+      - name: Login ghcr
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build and push image
+        run: |
+          docker buildx build . --push --platform linux/amd64 \
+            --build-arg VARIANT=static --build-arg COMMAND_NAME=controller \
+            -t ghcr.io/sarthak160/ai-gateway-controller:pr2378-mi
