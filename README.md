@@ -1,3 +1,8 @@
+> **Alpheya mirror.** This is `quantum-wealth/ai-gateway-controller`, an Alpheya-owned
+> mirror of the upstream Envoy AI Gateway controller carrying the Azure
+> managed-identity token-provider patch. See [docs/updating-upstream.md](docs/updating-upstream.md)
+> for what differs and how to sync. The rest of this README is upstream's.
+
 # Envoy AI Gateway
 
 Envoy AI Gateway is an open source project for using [Envoy Gateway](https://github.com/envoyproxy/gateway) to handle request traffic from application clients to Generative AI services.
