@@ -272,7 +272,9 @@ type BackendSecurityPolicyAzureCredentials struct {
 	// +optional
 	OIDCExchangeToken *AzureOIDCExchangeToken `json:"oidcExchangeToken,omitempty"`
 
-	// ManagedIdentity configures Azure managed identity authentication.
+	// ManagedIdentity configures Azure managed identity authentication. Access tokens are obtained by the
+	// data plane with the managed identity available to the Envoy proxy pods, e.g. Azure Workload Identity
+	// federated to their service account. The controller's own identity is not used.
 	//
 	// +optional
 	ManagedIdentity *AzureManagedIdentity `json:"managedIdentity,omitempty"`

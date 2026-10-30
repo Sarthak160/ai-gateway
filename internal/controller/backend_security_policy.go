@@ -123,6 +123,15 @@ func (c *BackendSecurityPolicyController) reconcile(ctx context.Context, bsp *ai
 		}
 	}
 
+	// Skip rotation for Azure managed identity: the extproc obtains tokens with the managed identity
+	// of the data plane pod, so the controller's own identity is never used for the policy.
+	if bsp.Spec.Type == aigv1b1.BackendSecurityPolicyTypeAzureCredentials &&
+		bsp.Spec.AzureCredentials != nil && bsp.Spec.AzureCredentials.ManagedIdentity != nil {
+		c.logger.Info("Using Azure managed identity of the data plane, skipping rotation",
+			"namespace", bsp.Namespace, "name", bsp.Name)
+		requiresRotation = false
+	}
+
 	if requiresRotation {
 		res, err = c.rotateCredential(ctx, bsp)
 		if err != nil {
@@ -181,12 +190,8 @@ func (c *BackendSecurityPolicyController) rotateCredential(ctx context.Context, 
 		var provider tokenprovider.TokenProvider
 		options := policy.TokenRequestOptions{Scopes: []string{azureScopeURL}}
 
-		if managedIdentity := bsp.Spec.AzureCredentials.ManagedIdentity; managedIdentity != nil {
-			provider, err = tokenprovider.NewAzureManagedIdentityTokenProvider(ctx, managedIdentity.ClientID, options)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-		} else if oidc := getBackendSecurityPolicyAuthOIDC(&bsp.Spec); oidc != nil {
+		oidc := getBackendSecurityPolicyAuthOIDC(&bsp.Spec)
+		if oidc != nil {
 			var oidcProvider tokenprovider.TokenProvider
 			oidcProvider, err = tokenprovider.NewOidcTokenProvider(ctx, c.client, oidc, bsp.Namespace, c.referenceGrantValidator.validateSecretReference)
 			if err != nil {
@@ -221,7 +226,7 @@ func (c *BackendSecurityPolicyController) rotateCredential(ctx context.Context, 
 				return ctrl.Result{}, err
 			}
 		} else {
-			return ctrl.Result{}, fmt.Errorf("one of secret ref, oidc, or managed identity must be defined, namespace %s name %s", bsp.Namespace, bsp.Name)
+			return ctrl.Result{}, fmt.Errorf("one of secret ref or oidc must be defined, namespace %s name %s", bsp.Namespace, bsp.Name)
 		}
 
 		rotator, err = rotators.NewAzureTokenRotator(c.client, c.kube, c.logger, bsp.Namespace, bsp.Name, c.preRotationWindow, provider)
@@ -504,8 +509,8 @@ func getBSPGeneratedSecretName(bsp *aigv1b1.BackendSecurityPolicy) string {
 			return ""
 		}
 	case aigv1b1.BackendSecurityPolicyTypeAzureCredentials:
-		if bsp.Spec.AzureCredentials.OIDCExchangeToken == nil {
-			return ""
+		if bsp.Spec.AzureCredentials.ManagedIdentity != nil {
+			return "" // The data plane obtains tokens itself, nothing is rotated into a secret.
 		}
 	case aigv1b1.BackendSecurityPolicyTypeGCPCredentials:
 		if bsp.Spec.GCPCredentials.WorkloadIdentityFederationConfig == nil {

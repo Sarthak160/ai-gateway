@@ -585,21 +585,12 @@ func TestNewBackendSecurityPolicyController_ReconcileAzureMissingAuthMethod(t *t
 	require.NoError(t, cl.Create(t.Context(), bsp))
 	_, err := c.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: bspName}})
 	require.Error(t, err)
-	require.Equal(t, "one of secret ref, oidc, or managed identity must be defined, namespace default name my-azure-backend-security-policy", err.Error())
+	require.Equal(t, "one of secret ref or oidc must be defined, namespace default name my-azure-backend-security-policy", err.Error())
 }
 
 func TestNewBackendSecurityPolicyController_ReconcileAzureManagedIdentity(t *testing.T) {
-	// Route the IMDS request of the user-assigned managed identity credential through a local
-	// proxy that always fails, so that the rotation deterministically reaches the managed identity
-	// token provider and fails there, without depending on the environment running the tests.
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "unavailable in unit tests", http.StatusBadRequest)
-	}))
-	defer proxy.Close()
-	t.Setenv("AI_GATEWAY_AZURE_PROXY_URL", proxy.URL)
-
 	eventCh := internaltesting.NewControllerEventChan[*aigv1b1.AIServiceBackend]()
-	cl := fake.NewClientBuilder().WithScheme(Scheme).Build()
+	cl := fake.NewClientBuilder().WithScheme(Scheme).WithStatusSubresource(&aigv1b1.BackendSecurityPolicy{}).Build()
 	c := NewBackendSecurityPolicyController(cl, fake2.NewClientset(), ctrl.Log, eventCh.Ch, nil, DefaultPreRotationWindow)
 	bspName := "my-azure-managed-identity-policy"
 
@@ -614,14 +605,16 @@ func TestNewBackendSecurityPolicyController_ReconcileAzureManagedIdentity(t *tes
 	}
 	require.NoError(t, cl.Create(t.Context(), bsp))
 	res, err := c.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: bspName}})
-	// The managed identity token request fails in the unit test environment; the important part is
-	// that the reconciliation took the managed identity path instead of requiring a client secret
-	// or an OIDC configuration.
-	require.Error(t, err)
-	require.ErrorContains(t, err, "failed to execute rotation")
-	require.NotContains(t, err.Error(), "one of secret ref, oidc, or managed identity must be defined")
-	// A failed rotation is retried in one minute.
-	require.Equal(t, time.Minute, res.RequeueAfter)
+	require.NoError(t, err)
+	// The data plane obtains tokens with its own managed identity: nothing is rotated by the controller.
+	require.Zero(t, res.RequeueAfter)
+	err = cl.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: rotators.GetBSPSecretName(bspName)}, &corev1.Secret{})
+	require.True(t, apierrors.IsNotFound(err), "no token secret must be generated for a managed identity policy")
+
+	var updated aigv1b1.BackendSecurityPolicy
+	require.NoError(t, cl.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: bspName}, &updated))
+	require.Len(t, updated.Status.Conditions, 1)
+	require.Equal(t, aigv1b1.ConditionTypeAccepted, updated.Status.Conditions[0].Type)
 }
 
 // The BackendSecurityPolicy controller must not read a Secret from a foreign namespace referenced
@@ -1676,7 +1669,7 @@ func TestGetBSPGeneratedSecretName(t *testing.T) {
 			expectedName: "ai-eg-bsp-aws-oidc-bsp",
 		},
 		{
-			name: "Azure without OIDCExchangeToken",
+			name: "Azure with ClientSecretRef",
 			bsp: &aigv1b1.BackendSecurityPolicy{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "azure-bsp",
@@ -1684,8 +1677,22 @@ func TestGetBSPGeneratedSecretName(t *testing.T) {
 				Spec: aigv1b1.BackendSecurityPolicySpec{
 					Type: aigv1b1.BackendSecurityPolicyTypeAzureCredentials,
 					AzureCredentials: &aigv1b1.BackendSecurityPolicyAzureCredentials{
-						ClientSecretRef:   nil,
-						OIDCExchangeToken: nil,
+						ClientSecretRef: &gwapiv1.SecretObjectReference{Name: "some-azure-secret"},
+					},
+				},
+			},
+			expectedName: "ai-eg-bsp-azure-bsp",
+		},
+		{
+			name: "Azure with ManagedIdentity",
+			bsp: &aigv1b1.BackendSecurityPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "azure-mi-bsp",
+				},
+				Spec: aigv1b1.BackendSecurityPolicySpec{
+					Type: aigv1b1.BackendSecurityPolicyTypeAzureCredentials,
+					AzureCredentials: &aigv1b1.BackendSecurityPolicyAzureCredentials{
+						ManagedIdentity: &aigv1b1.AzureManagedIdentity{ClientID: "some-client-id"},
 					},
 				},
 			},
