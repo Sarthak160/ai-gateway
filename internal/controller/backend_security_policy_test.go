@@ -1783,10 +1783,7 @@ func TestGetBSPGeneratedSecretName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resultName := getBSPGeneratedSecretName(tt.bsp)
-			if resultName != "" {
-				require.Equal(t, tt.expectedName, resultName)
-			}
+			require.Equal(t, tt.expectedName, getBSPGeneratedSecretName(tt.bsp))
 		})
 	}
 }

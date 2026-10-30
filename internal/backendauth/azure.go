@@ -36,7 +36,7 @@ func newAzureHandler(auth *filterapi.AzureAuth) (filterapi.BackendAuthHandler, e
 
 // Do implements [Handler.Do].
 //
-// Extracts the azure access token from the local file and set it as an authorization header.
+// Sets the Authorization header from the managed identity credential when configured, otherwise from the static access token.
 func (a *azureHandler) Do(ctx context.Context, requestHeaders map[string]string, _ []byte) ([]internalapi.Header, error) {
 	accessToken := a.azureAccessToken
 	if a.credential != nil {

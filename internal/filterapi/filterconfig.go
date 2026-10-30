@@ -306,7 +306,7 @@ func (a AnthropicAPIKeyAuth) LogValue() slog.Value {
 	return slog.GroupValue(slog.String("key", "[REDACTED]"))
 }
 
-// AzureAuth defines the file containing azure access token that will be mounted to the external proc.
+// AzureAuth defines how the external processor authenticates to Azure: a static access token, or a managed identity.
 type AzureAuth struct {
 	// AccessToken is the access token as a literal string.
 	AccessToken string `json:"accessToken"`
