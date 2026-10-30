@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -23,6 +24,7 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -72,9 +74,30 @@ type flags struct {
 	mcpFallbackSessionEncryptionIterations int
 	watchNamespaces                        []string
 	cacheSyncTimeout                       time.Duration
+	credentialPreRotationWindow            time.Duration
 	quotaRateLimitServiceAddr              string
 	quotaRateLimitTimeout                  int64
 	quotaRateLimitFailureModeDeny          bool
+}
+
+// extensionServerRunnable starts the extension server after the manager cache has synced.
+// It does not require leader election because every replica serves read-only extension requests.
+type extensionServerRunnable struct {
+	server   *grpc.Server
+	listener net.Listener
+}
+
+func (r extensionServerRunnable) Start(ctx context.Context) error {
+	stop := context.AfterFunc(ctx, r.server.GracefulStop)
+	defer stop()
+	if err := r.server.Serve(r.listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+		return fmt.Errorf("failed to serve extension server: %w", err)
+	}
+	return nil
+}
+
+func (extensionServerRunnable) NeedLeaderElection() bool {
+	return false
 }
 
 func setOptionalString(dst **string) func(string) error {
@@ -105,6 +128,15 @@ func parseWatchNamespaces(s string) []string {
 	}
 	return namespaces
 }
+
+const (
+	// mcpSessionEncryptionSeedEnvVar is the environment variable to read the MCP session encryption seed
+	// from when the mcpSessionEncryptionSeed flag is not set.
+	mcpSessionEncryptionSeedEnvVar = "MCP_SESSION_ENCRYPTION_SEED"
+	// mcpFallbackSessionEncryptionSeedEnvVar is the environment variable to read the MCP fallback session
+	// encryption seed from when the mcpFallbackSessionEncryptionSeed flag is not set.
+	mcpFallbackSessionEncryptionSeedEnvVar = "MCP_FALLBACK_SESSION_ENCRYPTION_SEED"
+)
 
 // parseAndValidateFlags parses the command-line arguments provided in args,
 // validates them, and returns the parsed configuration.
@@ -209,7 +241,7 @@ func parseAndValidateFlags(args []string) (*flags, error) {
 	endpointPrefixes := fs.String(
 		"endpointPrefixes",
 		"",
-		"Comma-separated key-value pairs for endpoint prefixes. Format: openai:/,cohere:/cohere,anthropic:/anthropic.",
+		"Comma-separated key-value pairs for endpoint prefixes. Format: openai:/,cohere:/cohere,anthropic:/anthropic,typesafe:/typesafe.",
 	)
 	rootPrefix := fs.String(
 		"rootPrefix",
@@ -246,12 +278,19 @@ func parseAndValidateFlags(args []string) (*flags, error) {
 		2*time.Minute, // This is the controller-runtime default
 		"Maximum time to wait for k8s caches to sync",
 	)
+	credentialPreRotationWindow := fs.Duration(
+		"credentialPreRotationWindow",
+		controller.DefaultPreRotationWindow,
+		"How long before expiry to rotate short-lived BackendSecurityPolicy credentials.",
+	)
 	mcpSessionEncryptionSeed := fs.String("mcpSessionEncryptionSeed", "default-insecure-seed",
-		"Seed used to derive the MCP session encryption key. This should be changed and set to a secure value.")
+		"Seed used to derive the MCP session encryption key. This should be changed and set to a secure value. "+
+			"Prefer the "+mcpSessionEncryptionSeedEnvVar+" environment variable to keep it out of the process command line.")
 	mcpSessionEncryptionIterations := fs.Int("mcpSessionEncryptionIterations", 100_000,
 		"Number of iterations to use for PBKDF2 key derivation for MCP session encryption.")
 	mcpFallbackSessionEncryptionSeed := fs.String("mcpFallbackSessionEncryptionSeed", "",
-		"Optional fallback seed used for MCP session key rotation")
+		"Optional fallback seed used for MCP session key rotation. "+
+			"Prefer the "+mcpFallbackSessionEncryptionSeedEnvVar+" environment variable to keep it out of the process command line.")
 	mcpFallbackSessionEncryptionIterations := fs.Int("mcpFallbackSessionEncryptionIterations", 100_000,
 		"Number of iterations used in the fallback PBKDF2 key derivation for MCP session encryption.")
 	quotaRateLimitServiceAddr := fs.String("quotaRateLimitServiceAddr", "envoy-ai-gateway-ratelimit.envoy-gateway-system",
@@ -264,6 +303,17 @@ func parseAndValidateFlags(args []string) (*flags, error) {
 	if err := fs.Parse(args); err != nil {
 		err = fmt.Errorf("failed to parse flags: %w", err)
 		return nil, err
+	}
+
+	// The MCP session encryption seeds can be provided through environment variables so that they are
+	// not exposed in the process command line. Explicitly set flags take precedence.
+	setFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	if v := os.Getenv(mcpSessionEncryptionSeedEnvVar); v != "" && !setFlags["mcpSessionEncryptionSeed"] {
+		*mcpSessionEncryptionSeed = v
+	}
+	if v := os.Getenv(mcpFallbackSessionEncryptionSeedEnvVar); v != "" && !setFlags["mcpFallbackSessionEncryptionSeed"] {
+		*mcpFallbackSessionEncryptionSeed = v
 	}
 
 	var slogLevel slog.Level
@@ -352,6 +402,10 @@ func parseAndValidateFlags(args []string) (*flags, error) {
 		return nil, fmt.Errorf("mcp fallback session encryption iterations must be positive: %d", *mcpFallbackSessionEncryptionIterations)
 	}
 
+	if *credentialPreRotationWindow <= 0 {
+		return nil, fmt.Errorf("credential pre-rotation window must be positive: %s", *credentialPreRotationWindow)
+	}
+
 	return &flags{
 		envoyGatewayNamespace:                  *envoyGatewayNamespace,
 		extProcLogLevel:                        *extProcLogLevelPtr,
@@ -380,6 +434,7 @@ func parseAndValidateFlags(args []string) (*flags, error) {
 		maxRecvMsgSize:                         *maxRecvMsgSize,
 		watchNamespaces:                        parseWatchNamespaces(*watchNamespaces),
 		cacheSyncTimeout:                       *cacheSyncTimeout,
+		credentialPreRotationWindow:            *credentialPreRotationWindow,
 		mcpSessionEncryptionSeed:               *mcpSessionEncryptionSeed,
 		mcpFallbackSessionEncryptionSeed:       *mcpFallbackSessionEncryptionSeed,
 		mcpSessionEncryptionIterations:         *mcpSessionEncryptionIterations,
@@ -469,15 +524,10 @@ func main() {
 	}
 	egextension.RegisterEnvoyGatewayExtensionServer(s, extSrv)
 	grpc_health_v1.RegisterHealthServer(s, extSrv)
-	go func() {
-		<-ctx.Done()
-		s.GracefulStop()
-	}()
-	go func() {
-		if err := s.Serve(lis); err != nil {
-			setupLog.Error(err, "failed to serve extension server")
-		}
-	}()
+	if err = mgr.Add(extensionServerRunnable{server: s, listener: lis}); err != nil {
+		setupLog.Error(err, "failed to register extension server")
+		os.Exit(1)
+	}
 
 	// Start the rate limit xDS config server.
 	rlRunner := runner.New(ctrl.Log, runner.DefaultPort)
@@ -512,6 +562,7 @@ func main() {
 		MCPFallbackSessionEncryptionSeed:       parsedFlags.mcpFallbackSessionEncryptionSeed,
 		MCPFallbackSessionEncryptionIterations: parsedFlags.mcpFallbackSessionEncryptionIterations,
 		RateLimitRunner:                        rlRunner,
+		CredentialPreRotationWindow:            parsedFlags.credentialPreRotationWindow,
 	}); err != nil {
 		setupLog.Error(err, "failed to start controller")
 	}
@@ -526,26 +577,31 @@ const mutatingWebhookConfigurationName = "envoy-ai-gateway-gateway-pod-mutator"
 // This allows users to only need to manage the secret and not take care of mutating webhook configuration.
 func maybePatchAdmissionWebhook(ctx context.Context, cli client.Client, bundlePath string) error {
 	webhookConfigName := fmt.Sprintf("%s.%s", mutatingWebhookConfigurationName, os.Getenv("POD_NAMESPACE"))
-	webhookCfg := &admissionregistrationv1.MutatingWebhookConfiguration{}
-	if err := cli.Get(ctx, client.ObjectKey{Name: webhookConfigName}, webhookCfg); err != nil {
-		return fmt.Errorf("failed to get mutating webhook configuration: %w", err)
-	}
+	// Every controller replica runs this before leader election, so they may race to update the same object.
+	// On conflict, re-read it: if another replica has already written the same bundle, there is nothing to do.
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		webhookCfg := &admissionregistrationv1.MutatingWebhookConfiguration{}
+		if err := cli.Get(ctx, client.ObjectKey{Name: webhookConfigName}, webhookCfg); err != nil {
+			return fmt.Errorf("failed to get mutating webhook configuration: %w", err)
+		}
 
-	if len(webhookCfg.Webhooks) != 1 {
-		return fmt.Errorf("expected 1 webhook in %s, got %d", webhookConfigName, len(webhookCfg.Webhooks))
-	}
+		if len(webhookCfg.Webhooks) != 1 {
+			return fmt.Errorf("expected 1 webhook in %s, got %d", webhookConfigName, len(webhookCfg.Webhooks))
+		}
 
-	bundle, err := os.ReadFile(bundlePath)
-	if err != nil {
-		return fmt.Errorf("failed to read CA bundle: %w", err)
-	}
-	if !bytes.Equal(webhookCfg.Webhooks[0].ClientConfig.CABundle, bundle) {
+		bundle, err := os.ReadFile(bundlePath)
+		if err != nil {
+			return fmt.Errorf("failed to read CA bundle: %w", err)
+		}
+		if bytes.Equal(webhookCfg.Webhooks[0].ClientConfig.CABundle, bundle) {
+			return nil
+		}
 		webhookCfg.Webhooks[0].ClientConfig.CABundle = bundle
 		if err := cli.Update(ctx, webhookCfg); err != nil {
 			return fmt.Errorf("failed to update mutating webhook configuration: %w", err)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // setupCache sets up the cache options based on the provided flags.

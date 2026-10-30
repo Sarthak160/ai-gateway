@@ -1647,6 +1647,7 @@ func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_ResponseBody(t *testing.T)
 					CompletionTokens: 20,
 					PromptTokensDetails: &openai.PromptTokensDetails{
 						CachedTokens:        5,
+						CacheWriteTokens:    7,
 						CacheCreationTokens: 7,
 					},
 				},
@@ -1895,7 +1896,7 @@ func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_ResponseBody(t *testing.T)
 					expectedUsage.SetCachedInputTokens(uint32(tt.output.Usage.PromptTokensDetails.CachedTokens)) //nolint:gosec
 				}
 				if tt.input.Usage.CacheWriteInputTokens != nil {
-					expectedUsage.SetCacheCreationInputTokens(uint32(tt.output.Usage.PromptTokensDetails.CacheCreationTokens)) //nolint:gosec
+					expectedUsage.SetCacheCreationInputTokens(uint32(tt.output.Usage.PromptTokensDetails.CacheWriteTokens)) //nolint:gosec
 				}
 			} else {
 				expectedUsage = tokenUsageFrom(-1, -1, -1, -1, -1, -1)
@@ -2913,4 +2914,19 @@ func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_Streaming_ResponseBody_Mar
 	require.Error(t, err)
 	require.ErrorContains(t, err, "failed to marshal streaming event")
 	require.ErrorContains(t, err, "injected marshal error")
+}
+
+func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_ResponseBody_NullContentBlock(t *testing.T) {
+	// A null element in the Converse content list must be skipped, not dereferenced.
+	respBody := []byte(`{"output":{"message":{"role":"assistant","content":[null,{"text":"Hello!"}]}},"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":20,"totalTokens":30}}`)
+	o := &openAIToAWSBedrockTranslatorV1ChatCompletion{}
+	var body []byte
+	var tokenUsage metrics.TokenUsage
+	var err error
+	require.NotPanics(t, func() {
+		_, body, tokenUsage, _, err = o.ResponseBody(nil, bytes.NewBuffer(respBody), false, nil)
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(body), "Hello!")
+	require.Equal(t, tokenUsageFrom(10, -1, -1, 20, 30, -1), tokenUsage)
 }

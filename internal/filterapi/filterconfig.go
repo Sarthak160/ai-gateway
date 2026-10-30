@@ -141,6 +141,9 @@ type VersionedAPISchema struct {
 
 // OpenAIPrefix returns the OpenAI API prefix for the VersionedAPISchema.
 func (v VersionedAPISchema) OpenAIPrefix() string {
+	if v.Name == APISchemaAWSOpenAI && v.Prefix == "" {
+		return "openai/v1"
+	}
 	return v.Prefix
 }
 
@@ -178,6 +181,10 @@ const (
 	// Used for Claude models hosted on AWS Bedrock. Supports both OpenAI and Anthropic input formats
 	// depending on the endpoint path, similar to APISchemaGCPAnthropic.
 	APISchemaAWSAnthropic APISchemaName = "AWSAnthropic"
+	// APISchemaAWSOpenAI represents the AWS OpenAI-compatible API schema.
+	APISchemaAWSOpenAI APISchemaName = "AWSOpenAI"
+	// APISchemaTypeSafe represents the native TypeSafe AI System One API schema (Jev).
+	APISchemaTypeSafe APISchemaName = "TypeSafe"
 )
 
 // RouteRuleName is the name of the route rule.
@@ -187,8 +194,11 @@ type RouteRuleName string
 // besides that this abstracts the concept of a backend at Envoy Gateway level to a simple name.
 type Backend struct {
 	// Name of the backend including the route name as well as the route rule index.
-	Name              string                        `json:"name"`
-	ModelNameOverride internalapi.ModelNameOverride `json:"modelNameOverride"`
+	Name string `json:"name"`
+	// AIServiceBackendName is the canonical namespace/name identity of the
+	// referenced AIServiceBackend. Name remains route-specific for routing.
+	AIServiceBackendName string                        `json:"aiServiceBackendName,omitempty"`
+	ModelNameOverride    internalapi.ModelNameOverride `json:"modelNameOverride"`
 	// Schema specifies the API schema of the output format of requests from.
 	Schema VersionedAPISchema `json:"schema"`
 	// Auth is the authn/z configuration for the backend. Optional.
@@ -197,6 +207,9 @@ type Backend struct {
 	HeaderMutation *HTTPHeaderMutation `json:"httpHeaderMutation,omitempty"`
 	// Body mutations to be applied to the request before sending to the backend. Optional.
 	BodyMutation *HTTPBodyMutation `json:"httpBodyMutation,omitempty"`
+	// HeaderValueFilters filter individual values out of multi-valued request headers before sending
+	// the request to the backend. Optional.
+	HeaderValueFilters []HTTPHeaderValueFilter `json:"headerValueFilters,omitempty"`
 }
 
 // BackendAuth corresponds partially to BackendSecurityPolicy in api/v1alpha1/api.go.
@@ -213,6 +226,8 @@ type BackendAuth struct {
 	AzureAuth *AzureAuth `json:"azure,omitempty"`
 	// GCPAuth specifies the location of GCP credential file.
 	GCPAuth *GCPAuth `json:"gcp,omitempty"`
+	// OpenAIAuth specifies the OpenAI access token obtained via token exchange.
+	OpenAIAuth *OpenAIAuth `json:"openai,omitempty"`
 	// CredentialOverride, when non-nil, sources the credential per-request instead of the
 	// static credential above. nil disables per-request sourcing (the default).
 	CredentialOverride *CredentialOverride `json:"credentialOverride,omitempty"`
@@ -302,6 +317,25 @@ func (a AzureAuth) LogValue() slog.Value {
 	return slog.GroupValue(slog.String("accessToken", "[REDACTED]"))
 }
 
+// OpenAIAuth defines the OpenAI access token and the optional organization and project headers.
+type OpenAIAuth struct {
+	// AccessToken is the access token as a literal string.
+	AccessToken string `json:"accessToken"`
+	// Organization is sent in the OpenAI-Organization header when set.
+	Organization string `json:"organization,omitempty"`
+	// Project is sent in the OpenAI-Project header when set.
+	Project string `json:"project,omitempty"`
+}
+
+// LogValue implements slog.LogValuer for OpenAIAuth to redact sensitive information.
+func (a OpenAIAuth) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("accessToken", "[REDACTED]"),
+		slog.String("organization", a.Organization),
+		slog.String("project", a.Project),
+	)
+}
+
 // GCPAuth defines the GCP authentication configuration used to access Google Cloud AI services.
 type GCPAuth struct {
 	// AccessToken is the access token as a literal string.
@@ -325,6 +359,16 @@ func (g GCPAuth) LogValue() slog.Value {
 		slog.String("region", g.Region),
 		slog.String("projectName", g.ProjectName),
 	)
+}
+
+// HTTPHeaderValueFilter filters individual values out of a multi-valued request header before
+// forwarding upstream. Mode is either "Denylist" (drop the listed Values) or "Allowlist" (keep only
+// the listed Values).
+type HTTPHeaderValueFilter struct {
+	// Name is the lower-cased name of the header whose values are filtered.
+	Name   string   `json:"name"`
+	Mode   string   `json:"mode"`
+	Values []string `json:"values,omitempty"`
 }
 
 // HTTPHeaderMutation defines the mutation of HTTP headers that will be applied to the request
